@@ -9,3 +9,4 @@ cd openvpn-site2site-automation
 chmod +x ./run.sh
 ./run.sh
 ```
+

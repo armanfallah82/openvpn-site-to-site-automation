@@ -1,0 +1,249 @@
+- name: Generate SSH key on server1
+  hosts: server1
+  become: true
+  tasks:
+    - name: Ensure ssh dir
+      file:
+        path: /root/.ssh
+        state: directory
+        mode: '0700'
+
+    - name: Generate key if not exists
+      openssh_keypair:
+        path: /root/.ssh/id_rsa
+        type: rsa
+        size: 2048
+    - name: Install sshpass
+      package:
+        name: sshpass
+        state: present
+
+    - name: Add key to server2 (sshpass)
+      shell: |
+        PUBKEY="$(cat /root/.ssh/id_rsa.pub)"
+        sshpass -e ssh \
+          -o StrictHostKeyChecking=no \
+          -o PreferredAuthentications=password \
+          -o PubkeyAuthentication=no \
+          -p {{ server2_ssh_port }} \
+          root@{{ server2_ip }} "
+             mkdir -p /root/.ssh &&
+             chmod 700 /root/.ssh &&
+             touch /root/.ssh/authorized_keys &&
+             chmod 600 /root/.ssh/authorized_keys &&
+             grep -qxF \"$PUBKEY\" /root/.ssh/authorized_keys || echo \"$PUBKEY\" >> /root/.ssh/authorized_keys
+           "
+      environment:
+         SSHPASS: "{{ server2_ssh_password }}"
+
+  
+
+    - name: Restart ssh on server1
+      service:
+        name: ssh
+        state: restarted
+
+    - name: enable ipforward on both servers
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        state: present
+        reload: yes
+    - name: Enable ip_forward on server2
+      shell: |
+        ssh -p {{ server2_ssh_port }} root@{{ server2_ip }} "
+            sysctl -w net.ipv4.ip_forward=1 &&
+            sed -i '/^#*net.ipv4.ip_forward/c\net.ipv4.ip_forward=1' /etc/sysctl.conf
+        "
+    
+    - name: Ensure expect is installed
+      apt:
+            name: expect
+            state: present
+            update_cache: yes
+- name: Run OpenVPN install script (interactive)
+  hosts: server1
+  become: true
+  tasks:
+      - name: Check if OpenVPN is already installed
+        ansible.builtin.stat:
+         path: /etc/openvpn
+        register: openvpn_installed
+
+      - name: Download OpenVPN install script
+        ansible.builtin.get_url:
+          url: https://raw.githubusercontent.com/angristan/openvpn-install/cb0ef7b1c28261366badf7750819b5e0005e4e45/openvpn-install.sh
+          dest: /root/openvpn-install.sh
+          mode: '0755'
+        when: not openvpn_installed.stat.exists
+
+          
+        
+      - name: Create the expect script file
+        copy:
+          dest: /root/install_openvpn.expect
+          content: |
+            #!/usr/bin/expect -f
+
+            
+            set timeout 1000
+
+            
+            spawn bash /root/openvpn-install.sh
+
+            
+            expect "IP address" {
+                send "\r"
+            }
+
+            expect "IPv6" {
+                send "n\r"
+            }
+
+            expect "Port" {
+                send "\r"
+            }
+
+            expect "Protocol" {
+                send "\r"
+            }
+
+            expect "DNS" {
+                send "\r"
+            }
+
+            expect "Allow multiple" {
+                send "\r"
+            }
+
+            expect "compression" {
+                send "n\r"
+            }
+
+            expect "encryption" {
+                send "\r"
+            }
+
+            expect "Press any key" {
+                send "\r"
+            }
+
+            expect "Client name:" {
+                send "myclient\r"
+            }
+
+            expect "Certificate" {
+                send "\r"
+            }
+
+            expect "Select an option " {
+                send "\r"
+            }
+
+            expect eof
+          mode: '0755'
+        when: not openvpn_installed.stat.exists
+
+      - name: Execute the expect script
+        ansible.builtin.command: /root/install_openvpn.expect
+        when: not openvpn_installed.stat.exists
+
+      - name: copy intall expect to server 2
+        shell: |
+          scp -P {{ server2_ssh_port }}  /root/install_openvpn.expect root@{{ server2_ip }}:/root/install_openvpn.expect
+      - name: set openvpn client name on server2
+        shell: |
+          ssh -p {{ server2_ssh_port }} root@{{ server2_ip }} '
+            set -e
+
+            sed -i "s/myclient/server1/g" /root/install_openvpn.expect
+          '
+                  
+
+      
+
+
+      - name: Create OpenVPN expect script on server2 (safe)
+        shell: |
+          ssh -p {{ server2_ssh_port }} root@{{ server2_ip }} '
+            set -e
+
+            if [ -f /etc/openvpn/server/server.conf ]; then
+              echo "OpenVPN already installed, skipping..."
+              exit 0
+            fi
+
+            apt update -y
+            apt install -y expect wget
+
+            wget -O /root/openvpn-install.sh https://raw.githubusercontent.com/angristan/openvpn-install/cb0ef7b1c28261366badf7750819b5e0005e4e45/openvpn-install.sh
+            chmod +x /root/openvpn-install.sh
+
+        
+            chmod +x /root/install_openvpn.expect
+            expect /root/install_openvpn.expect
+          '
+          
+      - name: Pull OpenVPN config from server2 to server1
+        shell: |
+          scp -P {{ server2_ssh_port }} \
+            root@{{ server2_ip }}:/root/server1.ovpn \
+            /etc/openvpn/client/server1.conf
+      - name: Ensure route-nopull is present
+        ansible.builtin.lineinfile:
+          path: /etc/openvpn/client/server1.conf
+          regexp: "^route-nopull$"
+          line: "route-nopull"
+          insertbefore: "^<ca>"
+          state: present
+      - name: Update OpenVPN subnet and routes on server2
+        shell: |
+          ssh -p {{ server2_ssh_port }} root@{{ server2_ip }} '
+            sed -i "s/10\.8\.0\.0/10.9.0.0/g" /etc/openvpn/server/server.conf
+          '        
+      - name: Replace redirect-gateway with route on server2
+        shell: |
+          ssh -p {{ server2_ssh_port }} root@{{ server2_ip }} '
+            sed -i "s|push \"redirect-gateway def1\"|push \"route 10.8.0.0 255.255.255.0\"|g" /etc/openvpn/server/server.conf
+          '
+      - name: Reload OpenVPN server on server2
+        shell: |
+          ssh -p {{ server2_ssh_port }} root@{{ server2_ip }} '
+            systemctl reload openvpn-server@server || systemctl restart openvpn-server@server
+
+          '
+      - name: Check tun0 is up
+        ansible.builtin.command: ip link show tun0
+        register: tun0_check
+        changed_when: false
+        failed_when: false
+
+      - name: Enable OpenVPN client service
+        ansible.builtin.systemd:
+          name: openvpn-client@server1
+          enabled: yes
+          state: started
+        when: tun0_check.rc == 0
+
+      - name: Routing OpenVPN traffic
+        shell: |
+          iptables -A FORWARD -o tun2 -j ACCEPT
+          grep -qxF "102 tun1_wan" /etc/iproute2/rt_tables || echo "102 tun1_wan" >> /etc/iproute2/rt_tables
+          ip route add default via 10.9.0.1 dev tun1 table tun1_wan || true
+          ip rule add from 10.8.0.0/24 lookup tun1_wan priority 100 || true
+          iptables -t nat -C POSTROUTING -o tun1 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o tun1 -j MASQUERADE
+
+      - name: Configure server2 network and firewall
+        shell: |
+          ssh -p {{ server2_ssh_port }} root@{{ server2_ip }} "
+            INTERFACE=$(ip -o -4 addr show | awk '{print $2}' | grep -v lo | head -n 1)
+
+            
+            iptables -t nat -C POSTROUTING -o \$INTERFACE -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o \$INTERFACE -j MASQUERADE
+            iptables -C FORWARD -i tun0 -o \$INTERFACE -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tun0 -o \$INTERFACE -j ACCEPT
+            iptables -C FORWARD -i \$INTERFACE -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i \$INTERFACE -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+            DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent
+            netfilter-persistent save
+          "
+        tags: server2-firewall      
