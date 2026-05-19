@@ -1,6 +1,6 @@
 1:
 ```bash
-git clone https://github.com/devopsgeeck/openvpn-site2site-automation.git
+git clone https://github.com/armanfallah82/openvpn-site-to-site-automation.git
 ```
 
 2:
